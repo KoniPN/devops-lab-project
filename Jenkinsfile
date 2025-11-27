@@ -54,8 +54,8 @@ pipeline {
             steps {
                 withCredentials([usernamePassword(credentialsId: 'github-login', passwordVariable: 'GIT_PASS', usernameVariable: 'GIT_USER')]) {
                     sh """
-                        git config user.email "jenkins@lab"
-                        git config user.name "Jenkins Bot"
+                        git config user.email "kong.18th@gmail.com"
+                        git config user.name "KoniPN"
                         
                         # ดึงโค้ดล่าสุด
                         git pull ${GIT_REPO} main
@@ -66,7 +66,7 @@ pipeline {
                         # Push กลับ GitHub
                         git add deployment.yaml
                         git commit -m "Jenkins updated version to ${TAG_VERSION}"
-                        git push https://${GIT_USER}:${GIT_PASS}@github.com/YOUR_GITHUB/devops-lab-project.git HEAD:main
+                        git push https://${GIT_USER}:${GIT_PASS}@github.com/KoniPN/devops-lab-project.git HEAD:main
                     """
                 }
             }
