@@ -4,4 +4,8 @@ CREATE TABLE IF NOT EXISTS users_test (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 INSERT INTO users_test (username) VALUES ('jenkins_user');
-SELECT id, username, created_at FROM users_test;
+SELECT
+    id,
+    username,
+    created_at
+FROM users_test;
