@@ -1,118 +1,110 @@
 pipeline {
-    agent {
-        kubernetes {
-            // กำหนดหน้าตาของ Pod ที่จะใช้รันงานนี้
-            yaml '''
-            apiVersion: v1
-            kind: Pod
-            spec:
-              containers:
-              # 1. Container สำหรับ Build Image (Kaniko)
-              - name: kaniko
-                image: gcr.io/kaniko-project/executor:debug
-                command: ["/busybox/cat"]
-                tty: true
-                volumeMounts:
-                  - name: docker-config
-                    mountPath: /kaniko/.docker
-              
-              # 2. Container สำหรับ Scan Security (Trivy)
-              - name: trivy
-                image: aquasec/trivy:latest
-                command: ["/bin/sh", "-c", "sleep 3600"] # สั่งให้ตื่นรอไว้
-                tty: true
-                
-              # 3. (Default) jnlp container มีอยู่แล้ว ไม่ต้องประกาศเพิ่ม (เอาไว้รัน git/sed)
-                
-              volumes:
-                - name: docker-config
-                  secret:
-                    secretName: docker-hub-secret
-                    items:
-                      - key: .dockerconfigjson
-                        path: config.json
-            '''
-        }
-    }
+    agent any
 
     environment {
-        // ชื่อ Image - ใช้ Jenkins Credentials แทน hardcode
-        IMAGE_NAME = credentials('DOCKER_IMAGE_NAME')  // เก็บใน Jenkins Credentials
+        IMAGE_NAME = "konipn/devops-lab"
         TAG = "v1-${BUILD_NUMBER}"
-        
-        // Git Repository - ใช้ Environment Variables
-        GIT_REPO = credentials('GIT_REPO_URL')  // เก็บใน Jenkins Credentials
-        GIT_CREDS_ID = "github-login"
-        
-        // Docker Registry
-        DOCKER_REGISTRY = credentials('DOCKER_REGISTRY_URL')
+        DOCKER_CREDS_ID = "docker-hub-secret"
     }
 
     stages {
-        // --- 1. สแกน Code (Filesystem) ---
-        stage('Scan Code for Secrets') {
+        stage('Checkout') {
             steps {
-                container('trivy') {
-                    echo "--- 🔍 Scanning Source Code for Secrets ---"
-                    // สแกนหา Secret Key ที่เผลอลืมทิ้งไว้
-                    // --exit-code 1 : เจอแล้วหยุดเลย
-                    sh "trivy fs --exit-code 1 --security-checks secret ."
+                checkout scm
+            }
+        }
+
+        // --- 1. ตรวจสอบ Secret (แบบวนลูปจนกว่าจะผ่าน) ---
+        stage('⛔ Security Check: Secrets') {
+            steps {
+                script {
+                    def isPassed = false
+                    
+                    // วนลูปจนกว่าค่า isPassed จะเป็น true
+                    while (!isPassed) {
+                        echo "--- 🕵️‍♂️ Starting Secret Scan... ---"
+                        
+                        // สั่ง Scan (ใช้ returnStatus: true เพื่อเอาค่า 0 หรือ 1 มาเช็คเอง ไม่ให้ Pipeline พัง)
+                        def exitCode = sh(
+                            script: "docker run --rm -v ${WORKSPACE}:/src aquasec/trivy fs --scanners secret --exit-code 1 /src",
+                            returnStatus: true
+                        )
+
+                        if (exitCode == 0) {
+                            echo "✅ Scan Passed! No secrets found."
+                            isPassed = true // หลุด Loop ไปทำต่อ
+                        } else {
+                            echo "❌ Scan Failed! Found secrets."
+                            
+                            // *** จุดมหัศจรรย์อยู่ตรงนี้ ***
+                            // Jenkins จะหยุดและสร้างปุ่มให้กด
+                            try {
+                                input message: '🚨 เจอ Secret Key! ไปลบใน Git เดี๋ยวนี้ แล้วกด Retry เพื่อตรวจใหม่', 
+                                      ok: '✅ แก้แล้ว! ตรวจใหม่เลย',
+                                      submitter: 'admin' // (Optional) ระบุว่าต้องเป็น admin เท่านั้นที่กดได้
+                                
+                                // พอกดปุ่ม มันจะไปดึง Code ล่าสุดที่เราเพิ่งแก้มา
+                                echo "🔄 Pulling latest code changes..."
+                                checkout scm
+                                
+                            } catch (err) {
+                                // ถ้ากด Abort หรือ Cancel
+                                error("❌ User aborted the pipeline.")
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // --- 2. Build & Push Image (Kaniko) ---
-        stage('Build & Push Image') {
+        stage('Build Image') {
             steps {
-                container('kaniko') {
-                    echo "--- 🏗 Building Docker Image ---"
-                    // Kaniko จะ Build และ Push ไปให้เลยในคำสั่งเดียว
-                    // *หมายเหตุสำหรับ Mac M1/M2: Kaniko จะ Build ตาม CPU เครื่อง 
-                    // ถ้า Server ปลายทางเป็น Intel (AMD64) ให้เพิ่ม --customPlatform=linux/amd64
-                    sh """
-                    /kaniko/executor \
-                        --context `pwd` \
-                        --destination ${IMAGE_NAME}:${TAG} \
-                        --customPlatform=linux/amd64
-                    """
+                sh "docker build --platform linux/amd64 -t ${IMAGE_NAME}:${TAG} ."
+            }
+        }
+
+        // --- 2. ตรวจสอบ CVE ด้วย Docker Scout (แบบวนลูปเหมือนกัน) ---
+        stage('🛡️ Docker Scout Check') {
+            steps {
+                script {
+                    def isPassed = false
+                    while (!isPassed) {
+                        withCredentials([usernamePassword(credentialsId: DOCKER_CREDS_ID, passwordVariable: 'PASS', usernameVariable: 'USER')]) {
+                            sh "echo $PASS | docker login -u $USER --password-stdin"
+                            
+                            // เช็ค CVE (Critical)
+                            def exitCode = sh(
+                                script: """
+                                    # ต้องติดตั้ง scout หรือใช้ image scout (ในที่นี้สมมติว่าเครื่องมี scout แล้ว)
+                                    docker scout cves ${IMAGE_NAME}:${TAG} --exit-code 1 --only-severity critical
+                                """,
+                                returnStatus: true
+                            )
+
+                            if (exitCode == 0) {
+                                isPassed = true
+                            } else {
+                                // ถ้าเจอช่องโหว่ หยุดรอให้แก้ Base Image หรือ Library
+                                try {
+                                    input message: '🚨 เจอช่องโหว่ Critical! ไปแก้ Dockerfile แล้วกด Retry', 
+                                          ok: '✅ แก้แล้ว! ตรวจใหม่'
+                                    
+                                    echo "🔄 Re-building image with fixes..."
+                                    checkout scm
+                                    sh "docker build --platform linux/amd64 -t ${IMAGE_NAME}:${TAG} ." // Build ใหม่ก่อนตรวจซ้ำ
+                                } catch (err) {
+                                    error("❌ User aborted the pipeline.")
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // --- 3. สแกน Image (Remote) ---
-        stage('Scan Image for Vulnerabilities') {
+        stage('Push Image') {
             steps {
-                container('trivy') {
-                    echo "--- 🛡 Scanning Remote Image ---"
-                    // ดึง Image ที่เพิ่ง Push ขึ้นไปมาสแกน
-                    // สแกนหา CRITICAL เท่านั้น และข้ามอันที่ยังไม่มี Patch แก้
-                    sh "trivy image --exit-code 1 --severity CRITICAL --ignore-unfixed ${IMAGE_NAME}:${TAG}"
-                }
-            }
-        }
-
-        // --- 4. แก้ Manifest และ Push Git (GitOps) ---
-        stage('Update Deployment Manifest') {
-            steps {
-                // ขั้นตอนนี้รันใน Container ปกติ (jnlp) ซึ่งเป็น Linux -> ใช้ sed ปกติได้เลย!
-                withCredentials([usernamePassword(credentialsId: GIT_CREDS_ID, passwordVariable: 'GIT_PASS', usernameVariable: 'GIT_USER')]) {
-                    sh """
-                        git config user.email "jenkins@example.com"
-                        git config user.name "Jenkins Bot"
-                        
-                        git pull ${GIT_REPO} main
-                        
-                        # ใช้ sed แบบ Linux ปกติ (ไม่ต้องมี '' เหมือนใน Mac)
-                        sed -i 's|image: ${IMAGE_NAME}:.*|image: ${IMAGE_NAME}:${TAG}|' deployment.yaml
-                        
-                        git add deployment.yaml
-                        
-                        # อย่าลืม [skip ci] เพื่อกัน Loop
-                        git commit -m "Update image to ${TAG} [skip ci]"
-                        
-                        git push https://${GIT_USER}:${GIT_PASS}@$(echo ${GIT_REPO} | sed 's|https://||') HEAD:main
-                    """
-                }
+                sh "docker push ${IMAGE_NAME}:${TAG}"
             }
         }
     }
