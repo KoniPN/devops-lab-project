@@ -36,13 +36,16 @@ pipeline {
     }
 
     environment {
-        // ชื่อ Image ของคุณ
-        IMAGE_NAME = "konipn/devops-lab"
+        // ชื่อ Image - ใช้ Jenkins Credentials แทน hardcode
+        IMAGE_NAME = credentials('DOCKER_IMAGE_NAME')  // เก็บใน Jenkins Credentials
         TAG = "v1-${BUILD_NUMBER}"
         
-        // Git Repository
-        GIT_REPO = "https://github.com/KoniPN/devops-lab-project.git"
-        GIT_CREDS_ID = "github-login" // ชื่อ Credential ID ใน Jenkins
+        // Git Repository - ใช้ Environment Variables
+        GIT_REPO = credentials('GIT_REPO_URL')  // เก็บใน Jenkins Credentials
+        GIT_CREDS_ID = "github-login"
+        
+        // Docker Registry
+        DOCKER_REGISTRY = credentials('DOCKER_REGISTRY_URL')
     }
 
     stages {
@@ -107,7 +110,7 @@ pipeline {
                         # อย่าลืม [skip ci] เพื่อกัน Loop
                         git commit -m "Update image to ${TAG} [skip ci]"
                         
-                        git push https://${GIT_USER}:${GIT_PASS}@github.com/KoniPN/devops-lab-project.git HEAD:main
+                        git push https://${GIT_USER}:${GIT_PASS}@$(echo ${GIT_REPO} | sed 's|https://||') HEAD:main
                     """
                 }
             }
