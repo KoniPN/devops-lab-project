@@ -19,37 +19,45 @@ pipeline {
             steps {
                 script {
                     def isPassed = false
-                    
-                    // วนลูปจนกว่าค่า isPassed จะเป็น true
                     while (!isPassed) {
-                        echo "--- 🕵️‍♂️ Starting Secret Scan... ---"
+                        echo "--- 🕵️‍♂️ เริ่มสแกนหา Secret... ---"
                         
-                        // สั่ง Scan (ใช้ returnStatus: true เพื่อเอาค่า 0 หรือ 1 มาเช็คเอง ไม่ให้ Pipeline พัง)
+                        // สแกนและเก็บค่า exit code
                         def exitCode = sh(
                             script: "docker run --rm -v ${WORKSPACE}:/src aquasec/trivy fs --scanners secret --exit-code 1 /src",
                             returnStatus: true
                         )
 
+                        echo "DEBUG: Trivy Exit Code = ${exitCode}"
+
                         if (exitCode == 0) {
-                            echo "✅ Scan Passed! No secrets found."
-                            isPassed = true // หลุด Loop ไปทำต่อ
+                            echo "✅ Scan ผ่าน! ไม่เจอ Secret"
+                            isPassed = true
                         } else {
-                            echo "❌ Scan Failed! Found secrets."
+                            echo "❌ Scan ไม่ผ่าน! เจอ Secret Key"
                             
-                            // *** จุดมหัศจรรย์อยู่ตรงนี้ ***
-                            // Jenkins จะหยุดและสร้างปุ่มให้กด
+                            // --- จุดที่ 1: สร้างปุ่มกด ---
+                            // Input จะทำให้ Pipeline หยุดรอ (Paused)
+                            // ให้สังเกตใน Console Output จะมี Link ให้กด "Proceed" หรือ "Abort"
                             try {
-                                input message: '🚨 เจอ Secret Key! ไปลบใน Git เดี๋ยวนี้ แล้วกด Retry เพื่อตรวจใหม่', 
-                                      ok: '✅ แก้แล้ว! ตรวจใหม่เลย',
-                                      submitter: 'admin' // (Optional) ระบุว่าต้องเป็น admin เท่านั้นที่กดได้
+                                input message: '🚨 เจอ Secret Key! กรุณาลบไฟล์ใน Git แล้วกดปุ่มนี้เพื่อตรวจใหม่', 
+                                      ok: '✅ แก้แล้ว! ตรวจใหม่',
+                                      submitterParameter: 'approve'
                                 
-                                // พอกดปุ่ม มันจะไปดึง Code ล่าสุดที่เราเพิ่งแก้มา
-                                echo "🔄 Pulling latest code changes..."
-                                checkout scm
+                                // --- จุดที่ 2: บังคับดึง Code ล่าสุด ---
+                                echo "🔄 กำลังดึง Code ล่าสุด..."
+                                withCredentials([usernamePassword(credentialsId: GIT_CREDS_ID, passwordVariable: 'GIT_PASS', usernameVariable: 'GIT_USER')]) {
+                                    sh """
+                                        git config user.email "jenkins@example.com"
+                                        git config user.name "Jenkins Bot"
+                                        # บังคับดึง Branch main ล่าสุด
+                                        git pull https://${GIT_USER}:${GIT_PASS}@github.com/KoniPN/devops-lab-project.git main
+                                    """
+                                }
                                 
                             } catch (err) {
-                                // ถ้ากด Abort หรือ Cancel
-                                error("❌ User aborted the pipeline.")
+                                echo "User aborted the build"
+                                error("❌ User ยกเลิกการตรวจสอบ")
                             }
                         }
                     }
