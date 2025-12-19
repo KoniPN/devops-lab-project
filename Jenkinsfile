@@ -1,11 +1,13 @@
 pipeline {
     agent {
         kubernetes {
+            // กำหนดหน้าตาของ Pod ที่จะใช้รันงานนี้
             yaml '''
             apiVersion: v1
             kind: Pod
             spec:
               containers:
+              # 1. Container สำหรับ Build Image (Kaniko)
               - name: kaniko
                 image: gcr.io/kaniko-project/executor:debug
                 command: ["/busybox/cat"]
@@ -13,6 +15,15 @@ pipeline {
                 volumeMounts:
                   - name: docker-config
                     mountPath: /kaniko/.docker
+              
+              # 2. Container สำหรับ Scan Security (Trivy)
+              - name: trivy
+                image: aquasec/trivy:latest
+                command: ["/bin/sh", "-c", "sleep 3600"] # สั่งให้ตื่นรอไว้
+                tty: true
+                
+              # 3. (Default) jnlp container มีอยู่แล้ว ไม่ต้องประกาศเพิ่ม (เอาไว้รัน git/sed)
+                
               volumes:
                 - name: docker-config
                   secret:
@@ -23,49 +34,79 @@ pipeline {
             '''
         }
     }
-    
-    parameters {
-        string(name: 'TAG_VERSION', defaultValue: 'v1', description: 'Version Tag')
-    }
 
     environment {
-        // แก้เป็นชื่อ Docker Hub คุณ
-        DOCKER_IMAGE = 'konipn/devops-lab' 
-        // แก้เป็น Link Repo GitHub คุณ
-        GIT_REPO = 'https://github.com/KoniPN/devops-lab-project.git'
+        // ชื่อ Image ของคุณ
+        IMAGE_NAME = "konipn/devops-lab"
+        TAG = "v1-${BUILD_NUMBER}"
+        
+        // Git Repository
+        GIT_REPO = "https://github.com/KoniPN/devops-lab-project.git"
+        GIT_CREDS_ID = "github-login" // ชื่อ Credential ID ใน Jenkins
     }
 
     stages {
+        // --- 1. สแกน Code (Filesystem) ---
+        stage('Scan Code for Secrets') {
+            steps {
+                container('trivy') {
+                    echo "--- 🔍 Scanning Source Code for Secrets ---"
+                    // สแกนหา Secret Key ที่เผลอลืมทิ้งไว้
+                    // --exit-code 1 : เจอแล้วหยุดเลย
+                    sh "trivy fs --exit-code 1 --security-checks secret ."
+                }
+            }
+        }
+
+        // --- 2. Build & Push Image (Kaniko) ---
         stage('Build & Push Image') {
             steps {
                 container('kaniko') {
-                    // Kaniko คือตัว Build Docker Image ใน K8s ที่ง่ายและปลอดภัยกว่า Docker-in-Docker
+                    echo "--- 🏗 Building Docker Image ---"
+                    // Kaniko จะ Build และ Push ไปให้เลยในคำสั่งเดียว
+                    // *หมายเหตุสำหรับ Mac M1/M2: Kaniko จะ Build ตาม CPU เครื่อง 
+                    // ถ้า Server ปลายทางเป็น Intel (AMD64) ให้เพิ่ม --customPlatform=linux/amd64
                     sh """
                     /kaniko/executor \
                         --context `pwd` \
-                        --destination ${DOCKER_IMAGE}:${TAG_VERSION} \
-                        --build-arg APP_VERSION=${TAG_VERSION}
+                        --destination ${IMAGE_NAME}:${TAG} \
+                        --customPlatform=linux/amd64
                     """
                 }
             }
         }
 
-        stage('Update Manifest (GitOps)') {
+        // --- 3. สแกน Image (Remote) ---
+        stage('Scan Image for Vulnerabilities') {
             steps {
-                withCredentials([usernamePassword(credentialsId: 'github-login', passwordVariable: 'GIT_PASS', usernameVariable: 'GIT_USER')]) {
+                container('trivy') {
+                    echo "--- 🛡 Scanning Remote Image ---"
+                    // ดึง Image ที่เพิ่ง Push ขึ้นไปมาสแกน
+                    // สแกนหา CRITICAL เท่านั้น และข้ามอันที่ยังไม่มี Patch แก้
+                    sh "trivy image --exit-code 1 --severity CRITICAL --ignore-unfixed ${IMAGE_NAME}:${TAG}"
+                }
+            }
+        }
+
+        // --- 4. แก้ Manifest และ Push Git (GitOps) ---
+        stage('Update Deployment Manifest') {
+            steps {
+                // ขั้นตอนนี้รันใน Container ปกติ (jnlp) ซึ่งเป็น Linux -> ใช้ sed ปกติได้เลย!
+                withCredentials([usernamePassword(credentialsId: GIT_CREDS_ID, passwordVariable: 'GIT_PASS', usernameVariable: 'GIT_USER')]) {
                     sh """
-                        git config user.email "kong.18th@gmail.com"
-                        git config user.name "KoniPN"
+                        git config user.email "jenkins@example.com"
+                        git config user.name "Jenkins Bot"
                         
-                        # ดึงโค้ดล่าสุด
                         git pull ${GIT_REPO} main
                         
-                        # ใช้คำสั่ง sed แก้เลขเวอร์ชันในไฟล์ deployment.yaml
-                        sed -i 's|image: .*|image: ${DOCKER_IMAGE}:${TAG_VERSION}|' deployment.yaml
+                        # ใช้ sed แบบ Linux ปกติ (ไม่ต้องมี '' เหมือนใน Mac)
+                        sed -i 's|image: ${IMAGE_NAME}:.*|image: ${IMAGE_NAME}:${TAG}|' deployment.yaml
                         
-                        # Push กลับ GitHub
                         git add deployment.yaml
-                        git commit -m "Jenkins updated version to ${TAG_VERSION}"
+                        
+                        # อย่าลืม [skip ci] เพื่อกัน Loop
+                        git commit -m "Update image to ${TAG} [skip ci]"
+                        
                         git push https://${GIT_USER}:${GIT_PASS}@github.com/KoniPN/devops-lab-project.git HEAD:main
                     """
                 }
