@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
       - name: nginx
-        image: konipn/devops-lab:v100
+        image: konipn/devops-lab:v1-2
         ports:
         - containerPort: 80
 ---
